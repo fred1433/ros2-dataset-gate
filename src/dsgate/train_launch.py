@@ -107,6 +107,9 @@ def _child(channel: str, workdir: str, version_id: str, steps: str) -> int:
         source_code=SourceCode(source_dir=str(TRAINING_DIR), entry_script="train.py"),
         compute=Compute(instance_type="local_cpu", instance_count=1),
         hyperparameters={"dataset_version": version_id, "steps": int(steps)},
+        # the container runs as root: no bytecode files left in the mounted code dirs,
+        # which the SDK removes as the host user afterwards
+        environment={"PYTHONDONTWRITEBYTECODE": "1"},
         local_container_root=str(root),
         base_job_name="dsgate-train",
     )
