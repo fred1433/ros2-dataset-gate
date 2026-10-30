@@ -5,13 +5,15 @@
 3. add batch 2 (an overlapping re-upload and known defects), build v2,
    killing two workers after their outputs and before their receipts
 4. resume from the frozen submission with a compacted plan, publish v2
-5. rebuild v2 in a fresh bucket without interruption: same version
-6. diff v1 -> v2
-7. training refuses a non-admitted version, then trains on v2
+5. rebuild v1 then v2 in a fresh bucket without interruption: same versions
+6. republish v2 under another name and another admission policy: no conflict
+7. diff v1 -> v2
+8. training refuses a non-admitted version, then trains on v2
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -22,10 +24,12 @@ from . import synth
 from .batch import (build_submission, make_plan, remaining, run_local, submit_requests, summarize,
                     upload_bags, upload_side, validate_requests)
 from .canon import cjson
+from .provenance import build_provenance
 from .publish import analysis_digest, publish
+from .recipe import analysis_part
 from .report import render_diff, render_report, seg_label
 from .store import Store
-from .train_launch import NotAdmitted, build_image, export, gate, run_process, run_sagemaker_local
+from .train_launch import NotAdmitted, gate, launch
 
 CONFIG = Path(__file__).resolve().parents[2] / "config"
 KILL = ("tractor-03/rosbag2_2026_10_14-13_00_30", "tractor-04/rosbag2_2026_10_15-09_10_40")
@@ -41,29 +45,29 @@ def start_emulator() -> tuple[object, str]:
     from moto.server import ThreadedMotoServer
 
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
-
     srv = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
     srv.start()
     host, port = srv.get_host_and_port()
     return srv, f"http://{host}:{port}"
 
 
-def run_batch(store: Store, sub: dict, recipe: dict, segment_ids: list[str], say, *, parallel=4,
-              reverse=False, kill=None) -> list[dict]:
-    rkey = f"recipes/{analysis_digest(recipe)[:12]}.json"
-    store.put_immutable(rkey, cjson(recipe))
-    plan = make_plan(store, sub, rkey, analysis_digest(recipe), segment_ids)
+def run_batch(store: Store, sub: dict, recipe: dict, segment_ids: list[str], say, env: dict, *, parallel=4,
+              reverse=False, kill=None, worker=None) -> list[dict]:
+    ad = analysis_digest(recipe)
+    akey = f"analyses/{ad[:16]}.json"
+    store.put_immutable(akey, cjson(analysis_part(recipe)))
+    plan = make_plan(store, sub, akey, ad, segment_ids, worker or build_provenance())
     reqs = submit_requests(plan, store.bucket)
     validate_requests(reqs)
     if not reqs:
         say("     nothing to submit (0 segments remaining)")
         return []
-    results = run_local(reqs, {}, parallel=parallel, reverse=reverse, kill_before_receipt=kill, plan=plan)
+    results = run_local(reqs, env, parallel=parallel, reverse=reverse, kill_before_receipt=kill, plan=plan)
     for line in summarize(reqs, results):
-        say("     " + line.split("  ", 1)[1] if line.startswith("plan-") else "     " + line)
+        say("     " + line)
     bad = [r for r in results if r["exit"] not in (0, -9, 137)]
     if bad:
-        raise RuntimeError("unexpected worker failure:\n" + "\n".join(r["stderr"] for r in bad))
+        raise RuntimeError("unexpected worker failure:\n" + "\n".join(r["stdout"] + r["stderr"] for r in bad))
     return results
 
 
@@ -88,7 +92,7 @@ def run_demo(out: Path, train: str = "sagemaker-local", parallel: int = 4, quiet
     saved = {k: os.environ.get(k) for k in env}
     os.environ.update(env)
     try:
-        return _story(out, train, parallel, say, transcript)
+        return _story(out, train, parallel, say, transcript, env)
     finally:
         for k, v in saved.items():
             if v is None:
@@ -98,106 +102,117 @@ def run_demo(out: Path, train: str = "sagemaker-local", parallel: int = 4, quiet
         srv.stop()
 
 
-def _story(out: Path, train: str, parallel: int, say, transcript: list[str]) -> dict:
+def _adm(m: dict) -> str:
+    return f"{m['status'].upper()}, {'ADMITTED' if m['admitted'] else 'NOT ADMITTED'}"
+
+
+def _story(out: Path, train: str, parallel: int, say, transcript: list[str], env: dict) -> dict:
     corpus = synth.generate(out / "corpus")
+    declared = corpus["declared"]
+    side_dir = out / "corpus" / "side"
     r1, r2, rbad = load_recipe("recipe_v1"), load_recipe("recipe_v2"), load_recipe("recipe_v2_split_by_segment")
     n_caps = len({c.capture_id for c in synth.BATCH1 + synth.BATCH2})
     say(f"[1] synthetic corpus: {len(corpus['batch1'])} bags in batch 1, {len(corpus['batch2'])} in batch 2 "
-        f"(sqlite3 and MCAP, {n_caps} captures), labels and calibration as side inputs")
+        f"(sqlite3 and MCAP, {n_caps} captures; {len(declared)} bags without custom_data, identity declared at "
+        "upload), labels and calibration as side inputs")
 
     store = Store("dsgate-demo")
     store.create_bucket()
-    side = upload_side(store, out / "corpus" / "side")
-    e1 = upload_bags(store, corpus["batch1"], out / "corpus" / "side")
+    side = upload_side(store, side_dir)
+    e1 = upload_bags(store, corpus["batch1"], declared)
     sub1 = build_submission(store, e1, side)
     say(f"[2] v1: submission frozen ({len(sub1['segments'])} segments: key, object version, size, sha256); "
         "SubmitJob requests validated against the botocore Batch model")
-    run_batch(store, sub1, r1, [s["segment_id"] for s in sub1["segments"]], say, parallel=parallel)
+    run_batch(store, sub1, r1, [s["segment_id"] for s in sub1["segments"]], say, env, parallel=parallel)
     v1 = publish(store, sub1, r1, "v1")
-    say(f"     published v1 = {v1['version_id']}  {v1['status'].upper()}, "
-        f"{'ADMITTED' if v1['admitted'] else 'NOT ADMITTED'}")
+    say(f"     published v1 = {v1['version_id']}  {_adm(v1)}")
 
-    e2 = upload_bags(store, corpus["batch2"], out / "corpus" / "side")
+    e2 = upload_bags(store, corpus["batch2"], declared)
     sub2 = build_submission(store, e1 + e2, side)
     by_bag = {s["bag"]: s for s in sub2["segments"]}
     kill = {by_bag[b]["segment_id"] for b in KILL}
     say(f"[3] v2: batch 2 uploaded, submission frozen ({len(sub2['segments'])} segments), recipe v2; "
         f"fault injection: the workers of {', '.join(seg_label({'bag': b}) for b in KILL)} are killed "
         "after writing their outputs, before their receipt")
-    run_batch(store, sub2, r2, [s["segment_id"] for s in sub2["segments"]], say, parallel=parallel, kill=kill)
+    run_batch(store, sub2, r2, [s["segment_id"] for s in sub2["segments"]], say, env, parallel=parallel, kill=kill)
     attempt = publish(store, sub2, r2, "v2")
     try:
-        gate(attempt)
+        launch(store, attempt, out / "train-refused-incomplete", mode="process")
         raise AssertionError("an incomplete version passed the gate")
     except NotAdmitted as exc:
-        say(f"     publish attempt: {attempt['status'].upper()}; training launcher refuses it: {exc}")
+        nothing = not (out / "train-refused-incomplete").exists()
+        say(f"     publish attempt: {attempt['status'].upper()}; launch() refuses it "
+            f"({'nothing exported' if nothing else 'FILES WRITTEN'}): {exc}")
 
-    rem = remaining(store, sub2, analysis_digest(r2))
-    say(f"[4] resume: {len(rem)} segment(s) without a receipt; new plan maps "
+    rem = remaining(store, sub2, analysis_digest(r2), build_provenance())
+    say(f"[4] resume: {len(rem)} segment(s) without a receipt for this computation; new plan maps "
         + ", ".join(f"index {i} -> {sid}" for i, sid in enumerate(rem)) + " (stable ids, not original indices)")
-    results = run_batch(store, sub2, r2, rem, say, parallel=parallel)
-    for r in results:
-        say(f"     {r['stdout'].splitlines()[-1]}")
+    results = run_batch(store, sub2, r2, rem, say, env, parallel=parallel)
+    resume_logs = [r["stdout"].splitlines()[-1] for r in results]
+    for line in resume_logs:
+        say(f"     {line}")
     v2 = publish(store, sub2, r2, "v2", previous=v1)
-    say(f"     published v2 = {v2['version_id']}  {v2['status'].upper()}, "
-        f"{'ADMITTED' if v2['admitted'] else 'NOT ADMITTED'}")
+    say(f"     published v2 = {v2['version_id']}  {_adm(v2)}")
 
     ref = Store("dsgate-reference")
     ref.create_bucket()
-    ref_side = upload_side(ref, out / "corpus" / "side")
-    ref_entries = upload_bags(ref, list(reversed(corpus["batch1"] + corpus["batch2"])), out / "corpus" / "side")
-    ref_sub = build_submission(ref, ref_entries, ref_side)
+    ref_side = upload_side(ref, side_dir)
+    batch1_rev = list(reversed(corpus["batch1"]))
+    ref_e1 = upload_bags(ref, batch1_rev, declared)
+    ref_sub1 = build_submission(ref, ref_e1, ref_side)
     say("[5] reference: fresh bucket, empty caches, arrival order reversed, 2 workers in reverse order, "
-        "no interruption")
-    run_batch(ref, ref_sub, r1, [s["segment_id"] for s in ref_sub["segments"] if s["bag"] in {e["bag"] for e in e1}],
-              say, parallel=2, reverse=True)
-    ref_v1 = publish(ref, ref_sub, r1, "v1-ref", write=False)
-    run_batch(ref, ref_sub, r2, [s["segment_id"] for s in ref_sub["segments"]], say, parallel=2, reverse=True)
-    ref_v2 = publish(ref, ref_sub, r2, "v2-ref", previous=v1)
+        "no interruption; v1 rebuilt on its own 7 segments, then used as the history of v2")
+    run_batch(ref, ref_sub1, r1, [s["segment_id"] for s in ref_sub1["segments"]], say, env, parallel=2, reverse=True)
+    ref_v1 = publish(ref, ref_sub1, r1, "v1-ref")
+    same_v1 = ref_v1["version_id"] == v1["version_id"] and ref_v1["samples"] == v1["samples"]
+    say(f"     reference v1 = {ref_v1['version_id']}  {_adm(ref_v1)}: {'IDENTICAL to' if same_v1 else 'DIFFERENT from'} v1")
+    ref_e2 = upload_bags(ref, list(reversed(corpus["batch2"])), declared)
+    ref_sub2 = build_submission(ref, ref_e1 + ref_e2, ref_side)
+    run_batch(ref, ref_sub2, r2, [s["segment_id"] for s in ref_sub2["segments"]], say, env, parallel=2, reverse=True)
+    ref_v2 = publish(ref, ref_sub2, r2, "v2-ref", previous=ref_v1)
     same_samples = ref_v2["samples"] == v2["samples"]
     same_decisions = sorted((s["segment_id"], s["status"]) for s in ref_v2["segments"]) == \
         sorted((s["segment_id"], s["status"]) for s in v2["segments"])
     identical = ref_v2["version_id"] == v2["version_id"] and same_samples and same_decisions
-    say(f"     reference v1 = {ref_v1['version_id']} ({'same as' if ref_v1['version_id'] == v1['version_id'] else 'DIFFERENT from'} v1)")
     say(f"     reference v2 = {ref_v2['version_id']}; resumed v2 = {v2['version_id']}: "
         f"{'IDENTICAL' if identical else 'DIFFERENT'} (version id, {len(v2['samples'])} samples with their shard keys, "
         f"{len(v2['segments'])} segment decisions)")
-    if not identical:
-        raise AssertionError("resumed build differs from the uninterrupted build")
-    say("[6] diff v1 -> v2: see below")
+    if not (identical and same_v1):
+        raise AssertionError("a reference build differs from the demo build")
+
+    again = publish(store, sub2, r2, "v2-again", previous=v1)
+    looser = copy.deepcopy(r2)
+    looser["admission"]["min_retained_fraction"] = 0.25
+    loose = publish(store, sub2, looser, "v2-looser-policy", previous=v1)
+    say(f"[6] same bucket: v2 republished under another name, then with min_retained_fraction 0.25: content "
+        f"{again['version_id']} and {loose['version_id']} (datasets/ object reused), builds "
+        f"{'distinct' if len({v2['build_id'], again['build_id'], loose['build_id']}) == 3 else 'NOT distinct'}, no conflict")
+    say("[7] diff v1 -> v2: see below")
 
     bad = publish(store, sub2, rbad, "v2-split-by-segment", previous=v1, write=False)
-    say(f"[7] training gate on a misconfigured split (split.unit = segment): {bad['version_id']} "
-        f"{'ADMITTED' if bad['admitted'] else 'NOT ADMITTED'}")
+    say(f"[8] training: misconfigured split (split.unit = segment) gives {bad['version_id']} {_adm(bad)}")
     try:
-        gate(bad)
+        launch(store, bad, out / "train-refused-leak", mode="process")
         raise AssertionError("a leaking version passed the gate")
     except NotAdmitted as exc:
-        say(f"     refused before export or container start: {exc}")
-    gate(v2)
-    channel = export(store, v2, out / "train" / "channel")
+        nothing = not (out / "train-refused-leak").exists()
+        say(f"     launch() refuses it ({'nothing exported, no container' if nothing else 'FILES WRITTEN'}): {exc}")
     model = None
-    if train == "sagemaker-local":
-        image_id = build_image()
-        proc = run_sagemaker_local(channel, out / "train", v2["version_id"])
-        (out / "train" / "sagemaker.log").write_text(proc.stdout + proc.stderr)
-        if proc.returncode != 0:
-            raise RuntimeError("SageMaker local training failed:\n" + (proc.stdout + proc.stderr)[-4000:])
-        model = json.loads((out / "train" / "container" / "artifacts" / "model" / "model.json").read_text())
-        say(f"     ModelTrainer, training_mode LOCAL_CONTAINER (sagemaker 3.28.0), image built locally from "
-            f"training/Dockerfile; child process with no AWS credentials or profile, AWS endpoints -> closed port")
-        (out / "train" / "image_id.txt").write_text(image_id + "\n")
-    elif train == "process":
-        proc = run_process(channel, out / "train" / "model", v2["version_id"])
-        if proc.returncode != 0:
-            raise RuntimeError(proc.stdout + proc.stderr)
-        model = json.loads((out / "train" / "model" / "model.json").read_text())
-        say("     training/train.py run as a local process (no container)")
-    if model is not None:
-        ok = model["dataset_version_id"] == v2["version_id"]
+    if train in ("sagemaker-local", "process"):
+        result = launch(store, v2, out / "train", mode=train)
+        model = result["model"]
+        if train == "sagemaker-local":
+            say("     launch(v2): ModelTrainer, training_mode LOCAL_CONTAINER (sagemaker 3.28.0), image built locally "
+                "from training/Dockerfile; child process with no AWS credentials or profile, AWS endpoints -> closed port")
+            (out / "train" / "image_id.txt").write_text(result["image_id"] + "\n")
+        else:
+            say("     launch(v2): training/train.py run as a local process (no container)")
+        ok = model["dataset_version_id"] == v2["version_id"] and \
+            model["dataset_manifest_sha256"] == result["manifest_sha256"]
         say(f"     model.json: dataset_version_id {model['dataset_version_id']} "
-            f"({'matches v2' if ok else 'MISMATCH'}), {model['steps']} steps on {model['samples']['train']} train "
-            f"samples, after the container re-verified the manifest, every shard and every sample row")
+            f"({'matches v2' if ok else 'MISMATCH'}), {model['steps']} smoke-test steps on {model['samples']['train']} "
+            "train samples, after the container checked the sealed manifest digest, the admission invariants, "
+            "every shard and every sample row")
         if not ok:
             raise AssertionError("model does not carry the version it was trained on")
     else:
@@ -211,14 +226,26 @@ def _story(out: Path, train: str, parallel: int, say, transcript: list[str]) -> 
     diff = render_diff(v1, v2)
     (out / "diff.txt").write_text(diff)
     (out / "transcript.txt").write_text("\n".join(transcript) + "\n")
-    (out / "README_block.md").write_text(readme_block(transcript, render_report(v2), diff))
+    blocks = readme_blocks(transcript, render_report(v2), diff)
+    (out / "README_excerpt.md").write_text(blocks["excerpt"])
+    (out / "README_block.md").write_text(blocks["full"])
     return {"v1": v1, "v2": v2, "ref_v2": ref_v2, "ref_v1": ref_v1, "bad": bad, "attempt": attempt,
-            "model": model, "sub2": sub2, "store": store, "kill": kill, "resumed": rem}
+            "again": again, "loose": loose, "model": model, "sub2": sub2, "store": store, "kill": kill, "resumed": rem,
+            "resume_logs": resume_logs, "transcript": transcript}
 
 
-def readme_block(transcript: list[str], report: str, diff: str) -> str:
-    return ("```text\n$ make demo\n" + "\n".join(transcript) + "\n```\n\n"
-            "```text\n" + report + "```\n\n" + "```text\n" + diff + "```\n")
+EXCERPT_MARKS = ("[3] v2:", "parent FAILED", "launch() refuses it (nothing exported)", "[4] resume:",
+                 "already present and identical", "published v2 =", "reference v2 =", "launch() refuses it (nothing exported, no container)",
+                 "model.json:")
+
+
+def readme_blocks(transcript: list[str], report: str, diff: str) -> dict:
+    excerpt = [line for line in transcript if any(m in line for m in EXCERPT_MARKS)]
+    return {
+        "excerpt": "```text\n" + "\n".join(excerpt) + "\n```\n",
+        "full": ("```text\n$ make demo\n" + "\n".join(transcript) + "\n```\n\n"
+                 "```text\n" + report + "```\n\n" + "```text\n" + diff + "```\n"),
+    }
 
 
 def main(argv=None) -> int:

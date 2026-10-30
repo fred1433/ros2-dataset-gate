@@ -12,7 +12,12 @@ So a data defect is a successful child that writes a ``quarantined`` receipt
 re-indexes the original list: it writes a new plan whose index ``i`` maps to a
 stable segment id, so a sibling finishing meanwhile cannot shift the mapping.
 The scheduler itself is not run here: ``run_local`` executes the same worker
-with the same environment the scheduler would set.
+with the same variables the scheduler would set.
+
+A receipt is reusable only for the exact computation it records. Its key is a
+digest of everything the result depends on: the segment's source digest, the
+annotations of its capture, the analysis parameters, and the worker's code,
+lockfile and image. Change any of them and the segment is computed again.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from .bagread import Unreadable, capture_identity, read_metadata
 from .canon import cjson, digest, sha256, short
 from .store import Store
 
@@ -32,8 +38,14 @@ MAX_ARRAY = 10_000
 
 # ----------------------------------------------------------------- submission
 
-def upload_bags(store: Store, bags: list[Path], side: Path) -> list[dict]:
-    """Upload raw bag directories into the versioned raw prefix; return entries."""
+def upload_bags(store: Store, bags: list[Path], declared: dict | None = None) -> list[dict]:
+    """Upload raw bag directories into the versioned raw prefix; return entries.
+
+    Capture identity, in order: what the uploader declares for the bag
+    (``declared[bag]``: an upload manifest, e.g. from the vehicle or the
+    garage), then rosbag2 ``custom_data`` (absent from Humble bags). A bag
+    with neither is quarantined by the worker as ``capture_identity_missing``.
+    """
     entries = []
     for bag in bags:
         files = []
@@ -41,7 +53,16 @@ def upload_bags(store: Store, bags: list[Path], side: Path) -> list[dict]:
             body = f.read_bytes()
             key = f"raw/{bag.parent.name}/{bag.name}/{f.name}"
             files.append({"key": key, "version_id": store.put(key, body), "size": len(body), "sha256": sha256(body)})
-        entries.append({"bag": f"{bag.parent.name}/{bag.name}", "files": files})
+        rel = f"{bag.parent.name}/{bag.name}"
+        if declared and rel in declared:
+            ident = {**declared[rel], "identity_source": "declared at upload"}
+        else:
+            try:
+                cid, vid = capture_identity(read_metadata(bag))
+                ident = {"capture_id": cid, "vehicle_id": vid, "identity_source": "rosbag2 custom_data"}
+            except Unreadable:
+                ident = {"capture_id": None, "vehicle_id": None, "identity_source": None}
+        entries.append({"bag": rel, "files": files, **ident})
     return entries
 
 
@@ -55,30 +76,57 @@ def upload_side(store: Store, side: Path) -> dict:
     return out
 
 
+def labels_ref(submission: dict, capture_id: str | None) -> dict | None:
+    if capture_id is None:
+        return None
+    return submission["side_inputs"]["labels"].get(capture_id.replace("/", "_"))
+
+
 def build_submission(store: Store, entries: list[dict], side: dict) -> dict:
     """Freeze content: id, object version, size, digest per file. Identical uploads collapse."""
     segments: dict[str, dict] = {}
     exact_reuploads = []
-    for e in entries:
+    for e in sorted(entries, key=lambda e: e["bag"]):
         source_digest = digest(sorted(f["sha256"] for f in e["files"]))
         seg_id = "seg-" + short(source_digest)
         if seg_id in segments:
             exact_reuploads.append({"segment_id": seg_id, "bag": e["bag"], "same_bytes_as": segments[seg_id]["bag"]})
             continue
-        segments[seg_id] = {"segment_id": seg_id, "bag": e["bag"], "source_digest": source_digest, "files": e["files"]}
-    body = {"format": "dsgate.submission/1", "segments": [segments[k] for k in sorted(segments)],
+        segments[seg_id] = {"segment_id": seg_id, "bag": e["bag"], "capture_id": e["capture_id"],
+                            "vehicle_id": e["vehicle_id"], "identity_source": e["identity_source"],
+                            "source_digest": source_digest, "files": e["files"]}
+    body = {"format": "dsgate.submission/2", "segments": [segments[k] for k in sorted(segments)],
             "side_inputs": side, "exact_reuploads": exact_reuploads}
     body["submission_id"] = "sub-" + short(digest(body))
     store.put_immutable(f"submissions/{body['submission_id']}.json", cjson(body))
     return body
 
 
+# --------------------------------------------------------- computation identity
+
+def compute_inputs(submission: dict, segment: dict, analysis_digest: str, worker: dict) -> dict:
+    ref = labels_ref(submission, segment["capture_id"])
+    return {"segment_id": segment["segment_id"], "source_digest": segment["source_digest"],
+            "labels_sha256": ref["sha256"] if ref else None, "analysis_digest": analysis_digest,
+            "worker": worker}
+
+
+def compute_key(inputs: dict) -> str:
+    return f"receipts/{inputs['segment_id']}/cmp-{short(digest(inputs), 16)}.json"
+
+
+def receipt_key(submission: dict, segment_id: str, analysis_digest: str, worker: dict) -> str:
+    seg = next(s for s in submission["segments"] if s["segment_id"] == segment_id)
+    return compute_key(compute_inputs(submission, seg, analysis_digest, worker))
+
+
 # ----------------------------------------------------------------- plans/jobs
 
-def make_plan(store: Store, submission: dict, recipe_key: str, analysis_digest: str,
-              segment_ids: list[str]) -> dict:
-    plan = {"format": "dsgate.plan/1", "submission_id": submission["submission_id"],
-            "recipe_key": recipe_key, "analysis_digest": analysis_digest, "segment_ids": list(segment_ids)}
+def make_plan(store: Store, submission: dict, analysis_key: str, analysis_digest: str,
+              segment_ids: list[str], worker: dict) -> dict:
+    plan = {"format": "dsgate.plan/2", "submission_id": submission["submission_id"],
+            "analysis_key": analysis_key, "analysis_digest": analysis_digest, "worker": worker,
+            "segment_ids": list(segment_ids)}
     plan["plan_id"] = "plan-" + short(digest(plan))
     plan["key"] = f"plans/{plan['plan_id']}.json"
     store.put_immutable(plan["key"], cjson(plan))
@@ -129,24 +177,25 @@ def resolve_index(plan: dict, env: dict) -> str:
     return plan["segment_ids"][idx]
 
 
-def receipt_key(analysis_digest: str, segment_id: str) -> str:
-    return f"receipts/{short(analysis_digest)}/{segment_id}.json"
-
-
-def remaining(store: Store, submission: dict, analysis_digest: str) -> list[str]:
-    done = {k.rsplit("/", 1)[1][:-5] for k in store.keys(f"receipts/{short(analysis_digest)}/")}
-    return [s["segment_id"] for s in submission["segments"] if s["segment_id"] not in done]
+def remaining(store: Store, submission: dict, analysis_digest: str, worker: dict) -> list[str]:
+    """Segments without a receipt for exactly this computation."""
+    return [s["segment_id"] for s in submission["segments"]
+            if not store.exists(compute_key(compute_inputs(submission, s, analysis_digest, worker)))]
 
 
 # --------------------------------------------------------------- local runner
 
+KEEP_ENV = ("PATH", "HOME", "VIRTUAL_ENV", "PYTHONPATH", "SYSTEMROOT", "TMPDIR", "LANG")
+
+
 def run_local(reqs: list[dict], base_env: dict, parallel: int = 4, reverse: bool = False,
-              kill_before_receipt: set[str] | None = None, plan: dict | None = None,
-              log=print) -> list[dict]:
+              kill_before_receipt: set[str] | None = None, plan: dict | None = None) -> list[dict]:
     """Run every child of every request as a separate worker process.
 
-    The environment matches what Batch sets: the overrides of the request and,
-    for array jobs only, AWS_BATCH_JOB_ARRAY_INDEX.
+    Each process gets a minimal environment (PATH and the interpreter's own
+    variables), ``base_env`` (emulator endpoint and dummy credentials), the
+    request's container overrides and, for array children only,
+    ``AWS_BATCH_JOB_ARRAY_INDEX``.
     """
     children = []
     for r in reqs:
@@ -162,14 +211,13 @@ def run_local(reqs: list[dict], base_env: dict, parallel: int = 4, reverse: bool
 
     def run(child):
         job, idx, env = child
-        full = {**os.environ, **base_env, **env}
+        full = {k: os.environ[k] for k in KEEP_ENV if k in os.environ} | base_env | env
         seg = resolve_index(plan, env) if plan else None
         if kill_before_receipt and seg in kill_before_receipt:
             full["DSGATE_KILL_BEFORE_RECEIPT"] = seg
         proc = subprocess.run([sys.executable, "-m", "dsgate.worker"], env=full, capture_output=True, text=True)
-        out = {"job": job, "index": idx, "segment_id": seg, "exit": proc.returncode,
-               "stdout": proc.stdout.strip(), "stderr": proc.stderr.strip()[-2000:]}
-        return out
+        return {"job": job, "index": idx, "segment_id": seg, "exit": proc.returncode,
+                "stdout": proc.stdout.strip(), "stderr": proc.stderr.strip()[-2000:]}
 
     with ThreadPoolExecutor(max_workers=parallel) as pool:
         results = list(pool.map(run, children))
@@ -184,7 +232,7 @@ def summarize(reqs: list[dict], results: list[dict]) -> list[str]:
         failed = [x for x in mine if x["exit"] != 0]
         kind = f"array size {r['arrayProperties']['size']}" if "arrayProperties" in r else "plain job (1 segment)"
         status = "FAILED" if failed else "SUCCEEDED"
-        lines.append(f"{r['jobName']}  {kind}: {len(mine) - len(failed)} succeeded, {len(failed)} failed -> parent {status}")
+        lines.append(f"{kind}: {len(mine) - len(failed)} succeeded, {len(failed)} failed -> parent {status}")
         for x in failed:
             why = "killed (SIGKILL)" if x["exit"] in (-9, 137) else f"exit {x['exit']}"
             lines.append(f"    child {x['index']} -> {x['segment_id']}: {why}")

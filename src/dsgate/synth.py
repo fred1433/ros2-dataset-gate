@@ -60,6 +60,9 @@ class CaptureSpec:
     vehicle_id: str
     start_utc: str  # "2026-10-12T08:14:00Z"
     segments: tuple[SegmentSpec, ...] = field(default_factory=tuple)
+    # True: metadata.yaml without custom_data (as recorded with Humble); the
+    # identity is declared by the uploader instead
+    declared_identity: bool = False
 
     @property
     def capture_id(self) -> str:
@@ -113,20 +116,20 @@ BATCH2 = (
         SegmentSpec(20, 30, M, expect=("retained",)),
         SegmentSpec(30, 40, M, (F("gap", LIDAR, at_s=33.05, dur_s=2.4),),
                     expect=("excluded", "stream_gap")),
-        SegmentSpec(40, 50, S, (F("rate", CAMERA, value=12),), expect=("excluded", "low_rate")),
+        SegmentSpec(40, 50, S, (F("rate", CAMERA, value=12),), expect=("excluded", "low_rate", "low_pairing")),
     )),
     CaptureSpec("tractor-03", "2026-10-14T13:00:00Z", (
         SegmentSpec(0, 10, M, (F("frozen", CAMERA, at_s=5.0, value=8),),
                     expect=("excluded", "frozen_content")),
-        # acquisition shifted by 18 ms, arrival at the recorder unchanged
+        # camera header.stamp shifted by 18 ms, recording timestamps unchanged
         SegmentSpec(10, 20, M, (F("acq_skew", CAMERA, value=18),),
-                    expect=("excluded", "acquisition_skew")),
-        # arrival delayed by 60 ms, acquisition unchanged: must not read as skew
+                    expect=("excluded", "pair_residual")),
+        # camera recording timestamps delayed by 60 ms, header.stamp unchanged: not a residual
         SegmentSpec(20, 30, S, (F("rec_delay", CAMERA, value=60),),
-                    expect=("retained", "recording_delay")),
+                    expect=("retained", "recording_offset")),
         SegmentSpec(30, 40, M, expect=("retained",)),
     )),
-    CaptureSpec("tractor-04", "2026-10-15T09:10:00Z", (
+    CaptureSpec("tractor-04", "2026-10-15T09:10:00Z", declared_identity=True, segments=(
         SegmentSpec(0, 10, M, damage="truncate", expect=("quarantined", "mcap_truncated")),
         SegmentSpec(10, 20, S, damage="truncate", expect=("quarantined", "db3_malformed")),
         # camera stamped on a boot clock: not comparable with the lidar clock
@@ -284,6 +287,11 @@ def segment_messages(capture: CaptureSpec, seg: SegmentSpec) -> list[tuple[int, 
                     k = int(round(f.value * N_POINTS))
                     idx = _rng(capture, 4, n).choice(N_POINTS, size=k, replace=False)
                     pts[idx, :3] = np.nan
+            # returns vary from sweep to sweep: 0 to 8 beams give no point
+            drop = int(_rng(capture, 5, n).integers(0, 9))
+            if drop:
+                keep = np.sort(_rng(capture, 6, n).choice(N_POINTS, size=N_POINTS - drop, replace=False))
+                pts = pts[keep]
             out.append((log, LIDAR, _cloud_msg(stamp, pts)))
 
     # camera
@@ -302,6 +310,8 @@ def segment_messages(capture: CaptureSpec, seg: SegmentSpec) -> list[tuple[int, 
             for f in _faults(seg, "rec_delay", CAMERA):
                 log += int(f.value) * 1_000_000
             if not lo <= log < hi:
+                continue
+            if any(f.at_s <= rel_s(stamp) < f.at_s + f.dur_s for f in _faults(seg, "gap", CAMERA)):
                 continue
             t_ms = (stamp - t0) // 1_000_000
             img = render_image(capture, m, t_ms)
@@ -324,7 +334,8 @@ def segment_messages(capture: CaptureSpec, seg: SegmentSpec) -> list[tuple[int, 
         for k in range(max(seg.start_s * 50 - 2, 0), seg.end_s * 50 + 2):
             stamp = t0 + k * ODOM_PERIOD_NS
             log = stamp + LATENCY_NS[ODOM]
-            if lo <= log < hi:
+            if lo <= log < hi and not any(f.at_s <= rel_s(stamp) < f.at_s + f.dur_s
+                                          for f in _faults(seg, "gap", ODOM)):
                 out.append((log, ODOM, _odom_msg(stamp, (stamp - t0) // 1_000_000)))
 
     out.sort(key=lambda x: (x[0], x[1]))
@@ -342,8 +353,9 @@ def write_segment(root: Path, capture: CaptureSpec, seg: SegmentSpec, storage: s
     plugin = StoragePlugin.MCAP if storage == "mcap" else StoragePlugin.SQLITE3
     msgs = segment_messages(capture, seg)
     with Writer(path, version=9, storage_plugin=plugin) as w:
-        w.set_custom_data("capture_id", capture.capture_id)
-        w.set_custom_data("vehicle_id", capture.vehicle_id)
+        if not capture.declared_identity:
+            w.set_custom_data("capture_id", capture.capture_id)
+            w.set_custom_data("vehicle_id", capture.vehicle_id)
         conns = {}
         for topic in (CAMERA, LIDAR, ODOM):
             if any(t == topic for _, t, _ in msgs):
@@ -384,14 +396,22 @@ def write_calibration(root: Path, vehicle_id: str) -> Path:
     return path
 
 
-def generate(out: Path) -> dict[str, list[Path]]:
-    """Write both upload batches and their side inputs. Returns bag paths per batch."""
+def generate(out: Path) -> dict:
+    """Write both upload batches and their side inputs.
+
+    Returns bag paths per batch, and ``declared``: the identities an uploader
+    declares for bags whose metadata has no custom_data.
+    """
     out = Path(out)
-    result: dict[str, list[Path]] = {"batch1": [], "batch2": []}
+    result: dict = {"batch1": [], "batch2": [], "declared": {}}
     for batch, captures in (("batch1", BATCH1), ("batch2", BATCH2)):
         for cap in captures:
             for seg in cap.segments:
-                result[batch].append(write_segment(out / batch, cap, seg))
+                path = write_segment(out / batch, cap, seg)
+                result[batch].append(path)
+                if cap.declared_identity:
+                    result["declared"][f"{path.parent.name}/{path.name}"] = {
+                        "capture_id": cap.capture_id, "vehicle_id": cap.vehicle_id}
     for cap in {c.capture_id: c for c in BATCH1 + BATCH2}.values():
         write_labels(out / "side", cap)
     for vehicle in sorted({c.vehicle_id for c in BATCH1 + BATCH2}):

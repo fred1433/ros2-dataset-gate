@@ -21,11 +21,12 @@ def topic_name(t: str) -> str:
 
 
 def seg_label(s: dict) -> str:
-    if s.get("start_log_ns") and s.get("vehicle_id") and s["vehicle_id"] != "unknown":
+    """Vehicle and first log_time of the segment in UTC; the bag name when the bag was not read."""
+    if s.get("start_log_ns") and s.get("vehicle_id"):
         t = datetime.fromtimestamp(s["start_log_ns"] // 1_000_000_000, tz=timezone.utc)
-        return f"{s['vehicle_id']} {t:%m-%d %H:%M:%S}"
+        return f"{s['vehicle_id']} {t:%m-%d %H:%M:%S}Z"
     vehicle, bag = s["bag"].split("/", 1)
-    return f"{vehicle} {bag[13:15]}-{bag[16:18]} {bag[19:21]}:{bag[22:24]}:{bag[25:27]}"
+    return f"{vehicle} {bag}"
 
 
 def _interval(f: dict) -> str:
@@ -40,9 +41,12 @@ def render_report(m: dict) -> str:
         f"dataset version {m['name']} = {m['version_id']}    {status}",
         f"recipe {m['recipe_digest'][:12]}  analysis {m['analysis_digest'][:12]}"
         + (f"  previous {m['previous']}" if m.get("previous") else ""),
-        f"provenance: code {pv['code_digest'][:12]}  lock {pv['lock_digest'][:12]}  image {pv['image']}",
-        "time: header.stamp = acquisition (Image, PointCloud2), used for pairing and skew;",
-        "      log_time = recorder clock, used to cut segments and to place intervals",
+        *[f"worker provenance (from the receipts): code {w['code_digest'][:12]}  lock {w['lock_digest'][:12]}  "
+          f"image {w['image'][:19] if w['image'].startswith('sha256:') else w['image']}" for w in pv["workers"]],
+        f"build {m['build_id']}  layout {m['layout_id']}",
+        "time: header.stamp = acquisition (Image, PointCloud2), used for pairing and residuals;",
+        "      log_time = recording timestamp, bounds each segment's window and places intervals;",
+        "      the nearest-pair residual is read modulo the camera period (here within +-25 ms)",
         "",
         f"segments                        samples (lidar sweep + camera frame within {m['recipe']['pairing']['window_ms']} ms)",
         f"  examined          {c['examined']:>4}          candidate in retained segments {c['samples_candidate']:>6}",
@@ -55,14 +59,14 @@ def render_report(m: dict) -> str:
         f"{c['quarantined']} + {c['no_receipt']}  (retained + excluded + deduplicated + quarantined + no receipt)",
         "",
         "findings (one line per occurrence; camera = /camera/front/image_raw, lidar = /lidar/points)",
-        f"  {'segment':<25} {'rule':<22} {'topic':<16} {'interval s':<11} {'measure':<38} {'threshold':<26} action",
+        f"  {'segment':<26} {'rule':<22} {'topic':<16} {'interval s':<11} {'measure':<46} {'threshold':<26} action",
     ]
     n_find = 0
     for s in sorted(m["segments"], key=seg_label):
         for f in s.get("findings", []):
             n_find += 1
-            lines.append(f"  {seg_label(s):<25} {f['rule']:<22} {topic_name(f['topic']):<16} {_interval(f):<11} "
-                         f"{topic_name(f['measure']):<38} {f['threshold']:<26} {f['action']}")
+            lines.append(f"  {seg_label(s):<26} {f['rule']:<22} {topic_name(f['topic']):<16} {_interval(f):<11} "
+                         f"{topic_name(f['measure']):<46} {f['threshold']:<26} {f['action']}")
     if not n_find:
         lines.append("  (none)")
     quar = [s for s in m["segments"] if s["status"] == "quarantined"]
@@ -70,23 +74,21 @@ def render_report(m: dict) -> str:
         lines += ["", "quarantined (original kept with its object version; the rest of the batch continued)"]
         for s in quar:
             q = s["quarantine"]
-            extra = ""
-            if q["kind"] == "mcap_truncated":
-                n = q["evidence"].get("complete_records_before_cut", 0)
-                extra = f"; {n} complete message records before the cut; recovery (mcap recover) not attempted"
-            lines.append(f"  {seg_label(s):<25} {q['kind']:<16} \"{q['error']}\"{extra}")
+            extra = "; recovery (mcap recover) not attempted" if q["kind"] == "mcap_truncated" else ""
+            lines.append(f"  {seg_label(s):<38} {q['kind']:<16} \"{q['error']}\"{extra}")
     dups = [s for s in m["segments"] if s.get("duplicate_of")]
     by_id = {s["segment_id"]: s for s in m["segments"]}
     if dups or m.get("exact_reuploads") or m.get("possible_duplicates"):
         lines += ["", "re-uploads (same capture id, same acquisition stamp, same content)"]
         for s in dups:
-            others = ", ".join(sorted(seg_label(by_id[o])[-8:] for o in s["duplicate_of"]))
-            lines.append(f"  {seg_label(s):<25} {s['samples_deduplicated']} of {s['samples_candidate']} samples "
+            others = ", ".join(sorted(seg_label(by_id[o])[-9:] for o in s["duplicate_of"]))
+            lines.append(f"  {seg_label(s):<26} {s['samples_deduplicated']} of {s['samples_candidate']} samples "
                          f"already published from {others}; {s['samples_published']} new")
         for e in m.get("exact_reuploads", []):
             lines.append(f"  {e['bag']}: same bytes as {e['same_bytes_as']}, collapsed at submission")
         for p in m.get("possible_duplicates", []):
-            lines.append(f"  possible duplicate, kept: {p['capture_id']} @ {p['ref_stamp_ns']} in {', '.join(p['segments'])}")
+            lines.append(f"  possible duplicate, {p['variants']} variants all kept: {p['capture_id']} @ {p['ref_stamp_ns']} "
+                         f"in {', '.join(p['segments'])}")
     lines += ["", "kept per capture",
               f"  {'capture':<30} {'segments kept':>14} {'samples':>8}  split"]
     per = defaultdict(lambda: [0, 0, 0])
@@ -139,7 +141,7 @@ def render_diff(a: dict, b: dict) -> str:
             n += 1
             why = "; ".join(f"{f['rule']} {topic_name(f['topic'])} {f['measure']} ({f['threshold']})"
                             for f in y["findings"] if f["action"] == "exclude_segment") or "-"
-            lines.append(f"  {seg_label(y):<25} {x['status']} -> {y['status']}: {why}")
+            lines.append(f"  {seg_label(y):<26} {x['status']} -> {y['status']}: {why}")
     if not n:
         lines.append("  (none)")
     tally = defaultdict(int)
@@ -151,8 +153,8 @@ def render_diff(a: dict, b: dict) -> str:
         if s["status"] == "quarantined":
             rules = s["quarantine"]["kind"]
         if s["status"] == "deduplicated":
-            rules = f"re-upload of {', '.join(sorted(seg_label(sb[o])[-8:] for o in s['duplicate_of']))}"
-        lines.append(f"  {seg_label(s):<25} {s['status']:<13} {rules}")
+            rules = f"re-upload of {', '.join(sorted(seg_label(sb[o])[-9:] for o in s['duplicate_of']))}"
+        lines.append(f"  {seg_label(s):<26} {s['status']:<13} {rules}")
     ra, rb = a.get("split_registry", {}), b.get("split_registry", {})
     moved = [c for c in ra if c in rb and ra[c] != rb[c]]
     new = {c: rb[c] for c in rb if c not in ra}
@@ -161,8 +163,8 @@ def render_diff(a: dict, b: dict) -> str:
     ca, cb = a["counts"], b["counts"]
     lines.append(f"published samples: {ca['samples_published']} -> {cb['samples_published']} "
                  f"(train {ca['train']} -> {cb['train']}, val {ca['val']} -> {cb['val']})")
-    keys_a = {smp["src"][k] for smp in a["samples"] for k in ("camera_key", "lidar_key")}
-    keys_b = {smp["src"][k] for smp in b["samples"] for k in ("camera_key", "lidar_key")}
+    keys_a = {smp["src"][k] for smp in a["samples"] for k in ("camera_key", "lidar_points_key", "lidar_offsets_key")}
+    keys_b = {smp["src"][k] for smp in b["samples"] for k in ("camera_key", "lidar_points_key", "lidar_offsets_key")}
     lines.append(f"storage: {len(keys_b & keys_a)} of {len(keys_b)} shard objects used by {b['name']} were already "
                  f"written for {a['name']} (content-addressed keys, nothing copied)")
     per_a, per_b = defaultdict(int), defaultdict(int)

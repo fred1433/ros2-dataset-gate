@@ -73,10 +73,13 @@ resource "aws_iam_role_policy" "worker_s3" {
         Resource = ["${aws_s3_bucket.data.arn}/*"]
       },
       {
-        Sid      = "WriteImmutableOutputs"
-        Effect   = "Allow"
-        Action   = ["s3:PutObject"]
-        Resource = [for p in local.worker_write_prefixes : "${aws_s3_bucket.data.arn}/${p}"]
+        # Only conditional creates: a PutObject without If-None-Match is not allowed
+        # (condition key from the S3 "enforce conditional writes" documentation).
+        Sid       = "WriteImmutableOutputs"
+        Effect    = "Allow"
+        Action    = ["s3:PutObject"]
+        Resource  = [for p in local.worker_write_prefixes : "${aws_s3_bucket.data.arn}/${p}"]
+        Condition = { Null = { "s3:if-none-match" = "false" } }
       },
       {
         Sid      = "ListForResume"
@@ -169,19 +172,21 @@ resource "aws_batch_job_definition" "worker" {
   name = "${var.name}-worker"
   type = "container"
 
-  # A Spot reclamation is retried by Batch. Anything else (a bug, an integrity
-  # failure, a conflict) exits non-zero once and is resumed explicitly from
-  # the frozen submission. Data defects never reach here: they exit 0 with a
-  # quarantined receipt.
+  # A Spot reclamation is retried by Batch. Any exit code (a bug, an integrity
+  # failure, a conflict) stops there and is resumed explicitly from the frozen
+  # submission. Data defects never reach here: they exit 0 with a quarantined
+  # receipt.
   retry_strategy {
     attempts = 3
     evaluate_on_exit {
       on_status_reason = "Host EC2*"
       action           = "RETRY"
     }
+    # When no condition matches, Batch retries: the last rule must match every
+    # exit code, hence on_exit_code, not on_reason (empty for a normal exit).
     evaluate_on_exit {
-      on_reason = "*"
-      action    = "EXIT"
+      on_exit_code = "*"
+      action       = "EXIT"
     }
   }
 

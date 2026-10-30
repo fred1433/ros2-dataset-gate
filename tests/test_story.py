@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from dsgate import synth
+from dsgate.canon import sha256
 from dsgate.train_launch import NotAdmitted, gate, run_process
 
 STATUSES = {"retained", "excluded", "deduplicated", "quarantined"}
@@ -72,10 +73,29 @@ def test_interruption_then_resume_equals_uninterrupted_build(demo):
     assert attempt["status"] == "incomplete"
     assert set(attempt["missing_receipts"]) == demo["kill"]
     assert sorted(demo["resumed"]) == sorted(demo["kill"])
+    # the kill happened after the outputs: the resumed workers found all 3 of them, identical
+    assert all("already present and identical 3" in line for line in demo["resume_logs"])
     assert v2["status"] == "complete" and v2["admitted"]
     assert ref["version_id"] == v2["version_id"]
     assert ref["samples"] == v2["samples"]
-    assert demo["ref_v1"]["version_id"] == demo["v1"]["version_id"]
+
+
+def test_reference_v1_is_complete_and_is_the_history_of_reference_v2(demo):
+    ref1 = demo["ref_v1"]
+    assert ref1["status"] == "complete" and ref1["admitted"] and ref1["counts"]["examined"] == 7
+    assert ref1["samples"] == demo["v1"]["samples"]
+    assert demo["ref_v2"]["previous"] == ref1["version_id"]
+
+
+def test_same_content_under_another_name_or_policy_reuses_the_dataset_object(demo):
+    v2, again, loose = demo["v2"], demo["again"], demo["loose"]
+    assert v2["version_id"] == again["version_id"] == loose["version_id"]
+    assert len({v2["build_id"], again["build_id"], loose["build_id"]}) == 3
+
+
+def test_workers_provenance_comes_from_the_receipts(demo):
+    workers = demo["v2"]["provenance"]["workers"]
+    assert len(workers) == 1 and set(workers[0]) == {"code_digest", "lock_digest", "image"}
 
 
 def test_incomplete_and_leaking_versions_are_refused_before_training(demo):
@@ -84,11 +104,13 @@ def test_incomplete_and_leaking_versions_are_refused_before_training(demo):
     with pytest.raises(NotAdmitted, match="train_val_leakage"):
         gate(demo["bad"])
     gate(demo["v2"])
+    assert not (demo["out"] / "train-refused-incomplete").exists()
+    assert not (demo["out"] / "train-refused-leak").exists()
 
 
 def test_reupload_is_one_contribution(demo):
     segs = {s["bag"]: s for s in demo["v2"]["segments"]}
-    re = segs["tractor-01/rosbag2_2026_10_12-08_14_14"]
+    re = segs["tractor-01/rosbag2_2026_10_12-08_14_14"]  # the re-cut upload
     assert re["status"] == "deduplicated" and re["samples_published"] == 0 and re["samples_deduplicated"] == 100
     originals = {segs["tractor-01/rosbag2_2026_10_12-08_14_10"]["segment_id"],
                  segs["tractor-01/rosbag2_2026_10_12-08_14_20"]["segment_id"]}
@@ -131,33 +153,82 @@ def _channel(demo, tmp_path):
     return ch
 
 
+def _seal(ch, m=None):
+    if m is not None:
+        (ch / "manifest.json").write_text(json.dumps(m, sort_keys=True, separators=(",", ":")))
+    return sha256((ch / "manifest.json").read_bytes())
+
+
+def _train(demo, ch, tmp_path, digest, version=None):
+    return run_process(ch, tmp_path / "model", version or demo["v2"]["version_id"], digest)
+
+
 def test_training_container_refuses_a_tampered_shard(demo, tmp_path):
     ch = _channel(demo, tmp_path)
     shard = sorted((ch / "shards").iterdir())[0]
     data = bytearray(shard.read_bytes())
     data[-1] ^= 0xFF
     shard.write_bytes(bytes(data))
-    proc = run_process(ch, tmp_path / "model", demo["v2"]["version_id"])
+    proc = _train(demo, ch, tmp_path, _seal(ch))
     assert proc.returncode == 2 and "REFUSED" in proc.stdout and "content hash" in proc.stdout
     assert not (tmp_path / "model" / "model.json").exists()
 
 
-def test_training_container_refuses_another_version_or_an_edited_manifest(demo, tmp_path):
+def test_training_container_refuses_an_unsealed_manifest(demo, tmp_path):
     ch = _channel(demo, tmp_path)
-    proc = run_process(ch, tmp_path / "model", demo["v1"]["version_id"])
+    m = json.loads((ch / "manifest.json").read_text())
+    m["name"] = "edited"
+    sealed = demo["model"]["dataset_manifest_sha256"]
+    _seal(ch, m)
+    proc = _train(demo, ch, tmp_path, sealed)
+    assert proc.returncode == 2 and "not the one sealed at admission" in proc.stdout
+
+
+def test_training_container_rechecks_admission_invariants(demo, tmp_path):
+    """A leaking manifest whose admitted flag was flipped, sealed by a careless launcher: still refused."""
+    ch = _channel(demo, tmp_path)
+    m = json.loads((ch / "manifest.json").read_text())
+    s0 = next(s for s in m["samples"] if s["split"] == "train")
+    s0["split"] = "val"
+    proc = _train(demo, ch, tmp_path, _seal(ch, m))
+    assert proc.returncode == 2 and "both sides of the split" in proc.stdout
+    m = json.loads((ch / "manifest.json").read_text())
+    m["gates"][1]["ok"] = False
+    proc = _train(demo, ch, tmp_path, _seal(ch, m))
+    assert proc.returncode == 2 and "contradicts the recorded gates" in proc.stdout
+
+
+def test_training_container_refuses_a_row_moved_to_another_valid_row(demo, tmp_path):
+    ch = _channel(demo, tmp_path)
+    m = json.loads((ch / "manifest.json").read_text())
+    s0 = m["samples"][0]
+    s0["src"]["row"] = 1  # another valid row of the same shards
+    proc = _train(demo, ch, tmp_path, _seal(ch, m))
+    assert proc.returncode == 2 and "row 1" in proc.stdout and "does not match the manifest" in proc.stdout
+
+
+def test_training_container_refuses_a_camera_row_from_another_shard(demo, tmp_path):
+    ch = _channel(demo, tmp_path)
+    m = json.loads((ch / "manifest.json").read_text())
+    s0 = m["samples"][0]
+    other = next(s for s in m["samples"] if s["src"]["camera_key"] != s0["src"]["camera_key"])
+    s0["src"]["camera_key"] = other["src"]["camera_key"]  # valid shard, valid row, wrong content
+    proc = _train(demo, ch, tmp_path, _seal(ch, m))
+    assert proc.returncode == 2 and "camera row 0" in proc.stdout
+
+
+def test_training_container_refuses_another_version_or_an_edited_label(demo, tmp_path):
+    ch = _channel(demo, tmp_path)
+    proc = _train(demo, ch, tmp_path, _seal(ch), version=demo["v1"]["version_id"])
     assert proc.returncode == 2 and "job asked for" in proc.stdout
     m = json.loads((ch / "manifest.json").read_text())
     m["samples"][0]["label_mm"] += 1
-    (ch / "manifest.json").write_text(json.dumps(m))
-    proc = run_process(ch, tmp_path / "model", demo["v2"]["version_id"])
+    proc = _train(demo, ch, tmp_path, _seal(ch, m))
     assert proc.returncode == 2 and "does not hash to its version id" in proc.stdout
-    m["samples"][0]["label_mm"] -= 1
-    m["admitted"] = False
-    (ch / "manifest.json").write_text(json.dumps(m))
-    proc = run_process(ch, tmp_path / "model", demo["v2"]["version_id"])
-    assert proc.returncode == 2 and "admitted=False" in proc.stdout
 
 
-def test_readme_block_is_written(demo):
+def test_readme_blocks_are_written(demo):
     block = (demo["out"] / "README_block.md").read_text()
     assert demo["v2"]["version_id"] in block and "IDENTICAL" in block
+    excerpt = (demo["out"] / "README_excerpt.md").read_text().splitlines()
+    assert 8 <= len(excerpt) - 2 <= 11 and any("parent FAILED" in l for l in excerpt)

@@ -19,8 +19,12 @@ variable "security_group_ids" {
 }
 
 variable "worker_image" {
-  description = "Worker image URI (built from docker/worker.Dockerfile)."
+  description = "Worker image pinned by digest (repo@sha256:...), built from docker/worker.Dockerfile."
   type        = string
+  validation {
+    condition     = can(regex("@sha256:[0-9a-f]{64}$", var.worker_image))
+    error_message = "worker_image must be pinned by digest (...@sha256:<64 hex>), not a mutable tag."
+  }
 }
 
 variable "max_vcpus" {
