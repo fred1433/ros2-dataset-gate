@@ -1,0 +1,38 @@
+[project]
+name = "ros2-dataset-gate"
+version = "0.1.0"
+description = "Turn ROS 2 bags into explicit, resumable, admission-gated dataset versions."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Frederic de Lavenne de Choulot" }]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "rosbags==0.11.9",
+    "mcap==1.6.0",
+    "numpy==2.5.4",
+    "boto3==1.43.122",
+]
+
+[project.optional-dependencies]
+train = ["sagemaker==3.28.0"]
+
+[dependency-groups]
+dev = [
+    "pytest==9.2.0",
+    "moto[server,s3]==5.2.5",
+]
+
+[project.scripts]
+dsgate = "dsgate.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dsgate"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning", "ignore::SyntaxWarning"]

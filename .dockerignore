@@ -1,0 +1,5 @@
+build
+.venv
+.git
+infra/.terraform
+**/__pycache__

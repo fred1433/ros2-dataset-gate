@@ -1,0 +1,56 @@
+{
+  "recipe": "front-camera-lidar",
+  "required_topics": {
+    "/camera/front/image_raw": {
+      "msgtype": "sensor_msgs/msg/Image",
+      "expected_hz": 20
+    },
+    "/lidar/points": {
+      "msgtype": "sensor_msgs/msg/PointCloud2",
+      "expected_hz": 10
+    },
+    "/odom": {
+      "msgtype": "nav_msgs/msg/Odometry",
+      "expected_hz": 50
+    }
+  },
+  "time_source": {
+    "acquisition": "header.stamp",
+    "segmentation": "log_time"
+  },
+  "pairing": {
+    "reference": "/lidar/points",
+    "match": "/camera/front/image_raw",
+    "window_ms": 25
+  },
+  "thresholds": {
+    "max_gap_s": 1.0,
+    "min_rate_ratio": 0.8,
+    "frozen_frames": 5,
+    "lidar_min_valid_ratio": 0.5,
+    "lidar_degraded_scans": 5,
+    "max_acq_skew_ms": 10,
+    "clock_domain_tolerance_ms": 1000,
+    "recording_delay_info_ms": 25
+  },
+  "policy": {
+    "required_stream_absent": "exclude_segment",
+    "stream_gap": "exclude_segment",
+    "low_rate": "exclude_segment",
+    "frozen_content": "exclude_segment",
+    "lidar_degraded": "exclude_segment",
+    "acquisition_skew": "exclude_segment",
+    "clock_not_comparable": "exclude_segment",
+    "recording_delay": "none"
+  },
+  "split": {
+    "unit": "capture",
+    "val_fraction": 0.3,
+    "salt": "split-4"
+  },
+  "admission": {
+    "min_retained_fraction": 0.5,
+    "max_leakage_groups": 0,
+    "min_samples_per_split": 50
+  }
+}

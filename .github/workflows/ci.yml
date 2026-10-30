@@ -1,0 +1,91 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pipeline:
+    name: tests + make demo (SageMaker local container)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.9.3"
+      - run: uv python install 3.12
+      - run: uv sync --frozen --all-extras
+      - name: unit, contract and story tests
+        run: uv run --frozen pytest
+      - name: make demo
+        run: make demo
+      - name: job summary
+        if: always()
+        run: |
+          {
+            echo '### make demo'
+            echo '```text'; cat build/demo/transcript.txt || true; echo '```'
+            echo '### v2 report'
+            echo '```text'; cat build/demo/v2/report.txt || true; echo '```'
+            echo '### diff v1 -> v2'
+            echo '```text'; cat build/demo/diff.txt || true; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: demo-output
+          path: |
+            build/demo/transcript.txt
+            build/demo/README_block.md
+            build/demo/diff.txt
+            build/demo/v1/
+            build/demo/v2/
+            build/demo/train/container/artifacts/model/model.json
+            build/demo/train/sagemaker.log
+      - name: README shows this run's output
+        run: uv run --frozen dsgate readme --check
+
+  batch-contract:
+    name: worker image run as Batch children
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.9.3"
+      - run: uv python install 3.12
+      - run: uv sync --frozen
+      - run: docker build -f docker/worker.Dockerfile --build-arg IMAGE_TAG=dsgate-worker:contract -t dsgate-worker:contract .
+      - name: S3 emulator container
+        run: |
+          docker network create dsgate-net
+          docker run -d --name moto --network dsgate-net -p 127.0.0.1:5000:5000 motoserver/moto:5.2.5
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:5000/moto-api/ >/dev/null && break; sleep 1; done
+      - name: array children, held-back child resumed as a plain job
+        env:
+          DSGATE_S3_ENDPOINT: http://127.0.0.1:5000
+          AWS_ACCESS_KEY_ID: testing
+          AWS_SECRET_ACCESS_KEY: testing
+          AWS_DEFAULT_REGION: us-east-1
+        run: uv run --frozen python -m dsgate.contract
+
+  terraform:
+    name: terraform fmt, validate, test (mocked provider)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: 1.17.1
+          terraform_wrapper: false
+      - run: terraform fmt -check -recursive
+      - run: terraform init -backend=false -input=false
+      - run: terraform validate
+      - run: terraform test
