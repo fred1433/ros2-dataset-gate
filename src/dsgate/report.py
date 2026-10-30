@@ -43,7 +43,7 @@ def render_report(m: dict) -> str:
         + (f"  previous {m['previous']}" if m.get("previous") else ""),
         *[f"worker provenance (from the receipts): code {w['code_digest'][:12]}  lock {w['lock_digest'][:12]}  "
           f"image {w['image'][:19] if w['image'].startswith('sha256:') else w['image']}" for w in pv["workers"]],
-        f"build {m['build_id']}  layout {m['layout_id']}",
+        f"layout {m['layout_id']}  (the build id covers S3 object versions, so it differs per run)",
         "time: header.stamp = acquisition (Image, PointCloud2), used for pairing and residuals;",
         "      log_time = recording timestamp, bounds each segment's window and places intervals;",
         "      the nearest-pair residual is read modulo the camera period (here within +-25 ms)",
