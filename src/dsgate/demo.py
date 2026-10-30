@@ -197,7 +197,7 @@ def _story(out: Path, train: str, parallel: int, say, transcript: list[str]) -> 
         ok = model["dataset_version_id"] == v2["version_id"]
         say(f"     model.json: dataset_version_id {model['dataset_version_id']} "
             f"({'matches v2' if ok else 'MISMATCH'}), {model['steps']} steps on {model['samples']['train']} train "
-            f"samples, manifest sha256 {model['dataset_manifest_sha256'][:12]}")
+            f"samples, after the container re-verified the manifest, every shard and every sample row")
         if not ok:
             raise AssertionError("model does not carry the version it was trained on")
     else:

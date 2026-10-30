@@ -80,7 +80,7 @@ def render_report(m: dict) -> str:
     if dups or m.get("exact_reuploads") or m.get("possible_duplicates"):
         lines += ["", "re-uploads (same capture id, same acquisition stamp, same content)"]
         for s in dups:
-            others = ", ".join(seg_label(by_id[o])[-8:] for o in s["duplicate_of"])
+            others = ", ".join(sorted(seg_label(by_id[o])[-8:] for o in s["duplicate_of"]))
             lines.append(f"  {seg_label(s):<25} {s['samples_deduplicated']} of {s['samples_candidate']} samples "
                          f"already published from {others}; {s['samples_published']} new")
         for e in m.get("exact_reuploads", []):
@@ -151,7 +151,7 @@ def render_diff(a: dict, b: dict) -> str:
         if s["status"] == "quarantined":
             rules = s["quarantine"]["kind"]
         if s["status"] == "deduplicated":
-            rules = f"re-upload of {', '.join(seg_label(sb[o])[-8:] for o in s['duplicate_of'])}"
+            rules = f"re-upload of {', '.join(sorted(seg_label(sb[o])[-8:] for o in s['duplicate_of']))}"
         lines.append(f"  {seg_label(s):<25} {s['status']:<13} {rules}")
     ra, rb = a.get("split_registry", {}), b.get("split_registry", {})
     moved = [c for c in ra if c in rb and ra[c] != rb[c]]
