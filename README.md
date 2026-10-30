@@ -80,8 +80,8 @@ $ make demo
 ```text
 dataset version v2 = ds-49ae5ae95634    COMPLETE, ADMITTED
 recipe 815f111ca83e  analysis 904ca5528ac2  previous ds-a1d9aacdbc14
-worker provenance (from the receipts): code 8ae89f7ada92  lock 7474f42c9c9e  image none (local process)
-build build-1ced4193afe4  layout layout-4650e111894d
+worker provenance (from the receipts): code cb9fcc1a848c  lock 7474f42c9c9e  image none (local process)
+layout layout-4650e111894d  (the build id covers S3 object versions, so it differs per run)
 time: header.stamp = acquisition (Image, PointCloud2), used for pairing and residuals;
       log_time = recording timestamp, bounds each segment's window and places intervals;
       the nearest-pair residual is read modulo the camera period (here within +-25 ms)
